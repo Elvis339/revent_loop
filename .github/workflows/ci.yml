@@ -2,30 +2,40 @@ on: [push, pull_request]
 name: CI
 
 jobs:
-  check:
+  compile:
+    name: Compile
     runs-on: ubuntu-latest
     steps:
-      - name: Check out
-        uses: actions/checkout@v3
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+      - name: Setup | Checkout
+        uses: actions/checkout@v2
+      - name: Setup | Rust
+        uses: ATiltedTree/setup-rust@v1
         with:
-          profile: minimal
-          components: rustfmt
-      - name: Cache
-        uses: actions/cache@v3
-        continue-on-error: false
+          rust-version: stable
+      - name: Build | Compile
+        run: cargo check
+  test:
+    name: Test
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macOS-latest
+        rust:
+          - stable
+          - beta
+          - nightly
+    runs-on: ${{ matrix.os }}
+    needs: [compile]
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v2
+      - name: Setup | Rust
+        uses: ATiltedTree/setup-rust@v1
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: Lint
-        run: cargo fmt --all -- --check
-      - name: Test
+          rust-version: ${{ matrix.rust }}
+      - name: Build | Compile
         run: cargo test
 
 
