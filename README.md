@@ -1,3 +1,3 @@
 # Goal
-- Understand concurrent software designs
-- Understand async
+- Understand low level concurrent software designs
+- Understand low level async model
