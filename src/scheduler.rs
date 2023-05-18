@@ -1,44 +1,109 @@
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::ops::{Sub};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{fmt, thread};
+use uuid::Uuid;
 
-pub struct Task {
-    callback: Box<dyn Fn() -> Option<Task>>,
+struct Task {
+    id: Uuid,
+    callback: Box<dyn FnOnce() + Send + 'static>,
+    expires: Option<Duration>,
+}
+
+impl fmt::Debug for Task {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Task").field("id", &self.id).finish()
+    }
 }
 
 impl Task {
-    fn new(callback: impl Fn() -> Option<Task> + 'static) -> Self {
+    fn new(callback: impl FnOnce() + Send + 'static, expires: Option<Duration>) -> Self {
         Self {
+            id: Uuid::new_v4(),
             callback: Box::new(callback),
+            expires,
         }
-    }
-
-    fn run(&self) -> Option<Task> {
-        (self.callback)()
     }
 }
 
-#[derive(Default)]
-pub struct Scheduler {
-    ready_fns: VecDeque<Task>,
+struct Scheduler {
+    ready_fns: Mutex<VecDeque<Task>>,
+    sleeping_fns: Mutex<VecDeque<Task>>,
 }
 
 impl Scheduler {
-    fn enqueue(&mut self, task: Task) {
-        self.ready_fns.push_back(task);
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ready_fns: Mutex::new(VecDeque::new()),
+            sleeping_fns: Mutex::new(VecDeque::new()),
+        })
     }
 
-    fn run_next(&mut self) {
-        if let Some(mut task) = self.ready_fns.pop_front() {
-            if let Some(next_task) = task.run() {
-                self.ready_fns.push_back(next_task);
+    fn schedule(&self, mut task: Task) {
+        match task.expires {
+            None => {
+                let mut ready_fns_guard = self.ready_fns.lock().unwrap();
+                ready_fns_guard.push_back(task);
+                drop(ready_fns_guard);
+            }
+            Some(expires) =>{
+                let mut sleeping_fns_guard = self.sleeping_fns.lock().unwrap();
+                task.expires = Some(expires);
+
+                // @todo: sort before pushing
+                sleeping_fns_guard.push_back(task);
+                drop(sleeping_fns_guard);
             }
         }
     }
 
-    fn run(&mut self) {
-        while !self.ready_fns.is_empty() {
-            self.run_next();
+    fn run(&self) {
+        let is_empty = |task: &str| {
+            if task == "ready" {
+                let ready_guard = self.ready_fns.lock().unwrap();
+                let empty = ready_guard.is_empty();
+                drop(ready_guard);
+                empty
+            } else {
+                let sleep_guard = self.sleeping_fns.lock().unwrap();
+                let empty = sleep_guard.is_empty();
+                drop(sleep_guard);
+                empty
+            }
+        };
+
+        let run_sleeping = || {
+            let mut sleeping_tasks = self.sleeping_fns.lock().unwrap();
+            if let Some(task) = sleeping_tasks.pop_front() {
+                if let Some(_) = task.expires {
+                    let now = Instant::now();
+                    let delta = task.expires.unwrap().sub(now.elapsed());
+                    if delta.as_secs() > 0 {
+                        thread::sleep(delta);
+                    }
+                    let mut ready_tasks = self.ready_fns.lock().unwrap();
+                    ready_tasks.push_back(task);
+                    drop(ready_tasks);
+                }
+            }
+            drop(sleeping_tasks);
+        };
+
+        let run_active = || {
+            let mut ready_task = self.ready_fns.lock().unwrap();
+            while let Some(task) = ready_task.pop_front() {
+                drop(ready_task);
+                (task.callback)();
+                ready_task = self.ready_fns.lock().unwrap();
+            }
+        };
+
+        while !is_empty("ready") || !is_empty("sleep") {
+            if is_empty("ready") {
+                run_sleeping();
+            }
+            run_active();
         }
     }
 }
@@ -49,48 +114,44 @@ mod test {
     use std::thread;
     use std::time::Duration;
 
-    fn countdown(n: usize, s: Rc<RefCell<Scheduler>>) -> Option<Task> {
+    fn countdown(n: usize, scheduler: Arc<Scheduler>) {
         if n > 0 {
-            println!("Countdown={}", n);
+            println!("Down={}", n);
             thread::sleep(Duration::from_secs(1));
-            let cloned = s.clone();
-            Some(Task::new(move || countdown(n - 1, cloned.clone())))
-        } else {
-            None
+            let scheduler_clone = scheduler.clone();
+            scheduler.schedule(Task::new(
+                move || countdown(n - 1, scheduler_clone.clone()),
+                Some(Duration::from_secs(2)),
+            ));
         }
     }
 
-    fn countup(stop: usize, x: usize, s: Rc<RefCell<Scheduler>>) -> Option<Task> {
-        if x < stop {
-            println!("Up={}", x);
-            thread::sleep(Duration::from_secs(1));
-            let cloned = s.clone();
-            Some(Task::new(move || countup(stop, x + 1, cloned.clone())))
-        } else {
-            None
+    fn countup(n: usize, scheduler: Arc<Scheduler>) {
+        if n > 0 {
+            println!("Up={}", n);
+            thread::sleep(Duration::from_secs(2));
+            let scheduler_clone = scheduler.clone();
+            scheduler.schedule(Task::new(
+                move || countup(n - 1, scheduler_clone.clone()),
+                None,
+            ))
         }
     }
 
     #[test]
     fn test() {
-        let scheduler = Rc::new(RefCell::new(Scheduler::default()));
+        let scheduler = Scheduler::new();
+
         {
-            let sc_ref = Rc::clone(&scheduler);
-            scheduler
-                .borrow_mut()
-                .enqueue(Task::new(move || countdown(3, sc_ref.clone())));
+            let scheduler_clone = scheduler.clone();
+            scheduler.schedule(Task::new(move || countdown(5, scheduler_clone), None));
         }
 
         {
-            let mut x = 0;
-            let sc_ref = Rc::clone(&scheduler);
-            scheduler
-                .borrow_mut()
-                .enqueue(Task::new(move || countup(3, x, sc_ref.clone())))
+            let scheduler_clone = scheduler.clone();
+            scheduler.schedule(Task::new(move || countup(3, scheduler_clone), None));
         }
 
-        while !scheduler.borrow().ready_fns.is_empty() {
-            scheduler.borrow_mut().run_next();
-        }
+        scheduler.run();
     }
 }
